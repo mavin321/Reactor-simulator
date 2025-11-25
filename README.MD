@@ -1,202 +1,242 @@
 
 ---
 
-# **CSTR Nonlinear Reactor Simulator**
+# **Advanced Nonlinear CSTR Simulator**
 
-*A single-file C program for solving stiff, nonlinear chemical engineering reactor models.*
+A comprehensive, single-file ANSI C simulation environment for a nonlinear, exothermic **Continuous Stirred–Tank Reactor (CSTR)** with full dynamic and steady-state capabilities.
 
----
+This project is designed for **chemical engineering education, numerical methods demonstrations, reactor stability analysis, and parameter studies**.
 
-## **Overview**
-
-This repository contains a fully self-contained C program (`reactor_sim.c`) that models, simulates, and analyzes a **Continuous Stirred-Tank Reactor (CSTR)** undergoing an **irreversible, exothermic, first-order reaction**:
-
-[
-A \rightarrow B
-]
-
-The system includes **nonlinear reaction kinetics (Arrhenius)** and **coupled mass & energy balances**, making the reactor prone to multiple steady states, ignition/extinction behavior, and thermal runaway — phenomena essential in real chemical & process engineering.
-
-This simulator is designed to show deep engineering understanding, numerical methods expertise, and clean C programming structure.
+The simulator includes robust ODE solvers, steady-state analyzers, parameter editing, dimensional analysis, and sweep utilities—all inside one C file.
 
 ---
 
-## **Key Features**
+## ⚙️ **Features**
 
-### ✔ **Nonlinear Reactor Model**
+### **Core Reactor Model**
 
-Implements full dynamic CSTR equations:
+* Irreversible, first-order exothermic reaction: **A → B**
+* Mass and energy balances with optional cooling:
 
-**Mass balance:**
+  * Adiabatic mode
+  * Non-adiabatic cooling via heat transfer jacket
+* Temperature-dependent Arrhenius kinetics
+* Reaction rate ( r_A = k_0 e^{-E/(RT)} C_A )
+
+---
+
+## 📊 **Numerical Capabilities**
+
+### **Steady-State Analysis**
+
+* Newton–Raphson solver with:
+
+  * Numerical Jacobian (central differences)
+  * Backtracking line search
+  * Singular matrix protection
+* Automatic steady-state stability classification:
+
+  * Jacobian eigenvalues
+  * Node/saddle/focus/stability type determination
+
+---
+
+### **Dynamic Simulation**
+
+Supports **four** explicit integration methods:
+
+| Integrator    | Order   | Notes                               |
+| ------------- | ------- | ----------------------------------- |
+| Euler         | 1st     | Simple and fast                     |
+| Heun / RK2    | 2nd     | Good accuracy, stable               |
+| Classic RK4   | 4th     | Default fixed-step workhorse        |
+| Adaptive RK45 | 4th/5th | Step-size control, error estimation |
+
+Adaptive RK45 includes:
+
+* Local truncation error estimation
+* Automatic step-size adjustment
+* Min/max dt limits
+* Safety factors
+* Rejection/acceptance logic
+
+---
+
+### **Parameter Tools**
+
+* Fully interactive runtime parameter editor
+* Preset reactor scenarios:
+
+  * Default moderate exotherm
+  * Adiabatic/hot feed
+  * Near-isothermal strong cooling
+  * Mild reaction
+  * Strongly exothermic system
+* Load/save parameter files (plain text)
+* Dimensionless group calculator (Da, β, γ)
+* Parameter sensitivity analysis using symmetric finite differences
+
+---
+
+### **Sweep Tools**
+
+* Automatic sweep of feed temperature ( T_f )
+* CSV export of:
+
+  * Steady-state concentration
+  * Reactor temperature
+  * Conversion
+  * Reaction rate
+
+---
+
+## 📁 **File Structure**
+
+```
+project-folder/
+│
+├── cstr_advanced.c     # The full simulator (1000+ lines single file)
+└── README.md           # This documentation
+```
+
+---
+
+## 🧪 **Model Equations**
+
+The simulator solves:
+
+### **Mass Balance**
+
 [
-\frac{dC_A}{dt} = \frac{C_{Af} - C_A}{\tau} - k_0 e^{-E/RT} C_A
+\frac{dC_A}{dt} = \frac{C_{Af} - C_A}{\tau} - k_0 e^{-E/(RT)} C_A
 ]
 
-**Energy balance:**
+### **Energy Balance**
+
 [
 \frac{dT}{dt} = \frac{T_f - T}{\tau}
--\frac{\Delta H}{\rho C_p} , r_A
--\frac{UA}{\rho C_p V}(T - T_c)
-]
 
-Supports both **cooled** and **adiabatic** reactors.
+* \left(\frac{-\Delta H}{\rho C_p}\right) r_A
 
----
-
-### ✔ **Steady-State Solver (Newton–Raphson)**
-
-* Computes steady states by solving
-  [
-  F(x) = 0
+- \left(\frac{UA}{\rho C_p V}\right)(T - T_c)
   ]
-* Uses **numerical Jacobian**,
-* **2×2 linear solver**,
-* **Line search damping** for robustness.
 
-This can capture multiple steady states depending on parameters.
+(Last term omitted in adiabatic mode.)
 
 ---
 
-### ✔ **Dynamic Simulation (Runge–Kutta 4)**
+## 🔧 **Compiling**
 
-* Solves stiff ODEs over time
-* Tracks concentration, temperature, reaction rate
-* Generates CSV output for plotting
-
----
-
-### ✔ **Parameter Sweep + CSV Export**
-
-Performs automatic continuation over feed temperature to generate full bifurcation-style data:
-
-```
-T_f, C_A_ss, T_ss, conversion, rA
-```
-
-Useful for plotting steady-state curves, ignition points, and S-shaped reactor profiles.
-
----
-
-### ✔ **Interactive Parameter Editor**
-
-All parameters are editable during runtime:
-
-* Kinetics (k0, E, ΔH)
-* Physical properties (ρ, Cp)
-* Reactor size and cooling
-* Feed concentration & temperature
-* Residence time
-* Adiabatic toggle
-
----
-
-### ✔ **Single-File, No Dependencies**
-
-Compile with:
+Compile using **GCC** or any C11-compliant compiler:
 
 ```bash
-gcc -Wall -Wextra -pedantic -std=c11 reactor_sim.c -lm -o reactor_sim
+gcc -O2 -Wall -std=c11 cstr_advanced.c -lm -o cstr_sim
 ```
 
-Run with:
+Run:
 
 ```bash
-./reactor_sim
+./cstr_sim
 ```
 
 ---
 
-## **Typical Workflow**
-
-### 1. **Inspect or Edit Parameters**
-
-From the main menu:
+## 🖥️ **Program Menu Overview**
 
 ```
-1) Show current parameters
-2) Edit parameters
+================== ADVANCED CSTR REACTOR SIMULATOR ==================
+1) Show current parameters and dimensionless groups
+2) Edit parameters / load presets / config files
+3) Solve for steady state (Newton-Raphson)
+4) Analyze stability at a steady state
+5) Basic dynamic simulation (fixed-step RK4)
+6) Advanced dynamic simulation (multi-integrator, adaptive)
+7) Sweep feed temperature and compute steady states
+8) Steady-state sensitivity to a chosen parameter
+0) Exit
+=====================================================================
 ```
-
-### 2. **Compute a Steady State**
-
-Enter an initial guess and optionally enable verbose Newton iterations:
-
-```
-3) Solve for steady state
-```
-
-### 3. **Dynamic Simulation**
-
-Simulate transient response and optionally save results:
-
-```
-4) Dynamic simulation
-```
-
-CSV output can be plotted using Python, Excel, MATLAB, etc.
 
 ---
 
-## **Example Plot (Interpretation)**
+## 📈 **Output Files**
 
-When sweeping feed temperature, the output CSV can be used to generate a characteristic S-curve:
+Many tools output CSV files containing:
 
-* Lower branch: low-temperature stable steady state
-* Middle branch: unstable (ignition point)
-* Upper branch: high-temperature runaway steady state
+* Time histories
+* Reaction rates
+* Steady-state branches
+* Sensitivity analysis results
 
-These are classic nonlinear reactor phenomena.
+These can be imported into:
 
----
-
-## **File Structure**
-
-| File            | Description                                                                            |
-| --------------- | -------------------------------------------------------------------------------------- |
-| `reactor_sim.c` | The full simulator (ODE solver, Newton solver, model equations, interactive interface) |
-| `README.md`     | Documentation (this file)                                                              |
+* Excel
+* MATLAB
+* Python (Pandas)
+* Mathematica
+* Plotting tools (Origin, gnuplot, etc.)
 
 ---
 
-## **Why This Project Is Impressive**
+## 📦 **Parameter File Format**
 
-This program demonstrates:
+Example of a saved configuration:
 
-### 🔹 **Process Engineering Knowledge**
-
-* Reaction kinetics
-* Heat & mass balances
-* Reactor stability theory
-* Thermal runaway and multiple steady states
-
-### 🔹 **Numerical Methods Expertise**
-
-* Newton–Raphson with Jacobian
-* Line search
-* Runge–Kutta ODE integration
-* Numerical continuation
-
-### 🔹 **Software Engineering Discipline**
-
-* Modular C design
-* Clear structs and state management
-* Robustness (bound checks, stability tools)
-* Meaningful physical units everywhere
-
-### 🔹 **Practical Deliverables**
-
-* CSV outputs for scientific plotting
-* Interactive simulations
-* Fully self-contained, professional-grade example code
-
-Perfect for demonstrating engineering, mathematical, and programming capability.
+```
+k0 1.0000000000000000e+06
+E  8.0000000000000000e+04
+dH -5.0000000000000000e+04
+rho 1.0000000000000000e+03
+Cp 4.1800000000000000e+03
+V 1.0000000000000000e+00
+tau 1.0000000000000000e+02
+U 5.0000000000000000e+02
+A 1.0000000000000000e+01
+C_Af 2.0000000000000000e+03
+T_f 3.5000000000000000e+02
+T_c 3.0000000000000000e+02
+adiabatic 0
+```
 
 ---
 
-## **License**
+## 📚 **Educational Value**
 
-MIT License (or any you prefer).
+This simulator demonstrates:
+
+* Nonlinear reactor behavior
+* Multiple steady states
+* Thermal runaway phenomena
+* Bifurcation behavior (via sweeps)
+* Numerical integration techniques
+* Newton–Raphson and stability concepts
+* Sensitivity and parametric dependence
+
+Perfect for:
+
+* Chemical engineering students
+* Numerical methods courses
+* Reaction engineering research
+* Control engineering and simulation exercises
 
 ---
 
+## 📌 **Planned Extensions (Optional)**
 
+If you want, I can help you add:
+
+* PID control loop (manipulate coolant temperature)
+* Two-species model (C_A, C_B, T)
+* Recycle stream and RTD effects
+* Multiple reactions
+* GUI (SDL2 or ImGui)
+
+Just ask!
+
+---
+
+## 📝 **License**
+
+This project is free to use, modify, and distribute for any educational or research purpose.
+
+---
