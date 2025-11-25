@@ -223,7 +223,6 @@ Perfect for:
 
 ## 📌 **Planned Extensions (Optional)**
 
-If you want, I can help you add:
 
 * PID control loop (manipulate coolant temperature)
 * Two-species model (C_A, C_B, T)
@@ -231,7 +230,6 @@ If you want, I can help you add:
 * Multiple reactions
 * GUI (SDL2 or ImGui)
 
-Just ask!
 
 ---
 
