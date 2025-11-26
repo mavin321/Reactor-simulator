@@ -9,7 +9,7 @@ This project is designed for **chemical engineering education, numerical methods
 
 The simulator includes robust ODE solvers, steady-state analyzers, parameter editing, dimensional analysis, and sweep utilities—all inside one C file.
 
----
+
 
 ## ⚙️ **Features**
 
@@ -78,15 +78,17 @@ Adaptive RK45 includes:
 
 ---
 
-### **Sweep Tools**
+### **Sweep & Analysis Tools**
 
 * Automatic sweep of feed temperature ( T_f )
-* CSV export of:
-
-  * Steady-state concentration
-  * Reactor temperature
-  * Conversion
-  * Reaction rate
+* 2D sweep of residence time vs. feed temperature
+* CSV export of steady-state concentration, reactor temperature, conversion, reaction rate
+* Sensitivity analysis (finite differences)
+* Batch scenario runner (preset stress tests)
+* Diagnostics/self-test harness (Jacobian, linear solve, RHS sanity)
+* Event-aware simulation path for detecting runaway/depletion triggers
+* Lightweight parameter estimation demo (k0, dH) from synthetic data
+* Uncertainty ensemble Monte Carlo on kinetics/thermo parameters
 
 ---
 
@@ -95,7 +97,7 @@ Adaptive RK45 includes:
 ```
 project-folder/
 │
-├── cstr_advanced.c     # The full simulator (1000+ lines single file)
+├── reactor_sim.c       # The full simulator (single-file)
 └── README.md           # This documentation
 ```
 
@@ -130,13 +132,13 @@ The simulator solves:
 Compile using **GCC** or any C11-compliant compiler:
 
 ```bash
-gcc -O2 -Wall -std=c11 cstr_advanced.c -lm -o cstr_sim
+gcc -O2 -Wall -std=c11 reactor_sim.c -lm -o cstr_sim
 ```
 
 Run:
 
 ```bash
-./cstr_sim
+./reactor_sim
 ```
 
 ---
@@ -145,15 +147,21 @@ Run:
 
 ```
 ================== ADVANCED CSTR REACTOR SIMULATOR ==================
-1) Show current parameters and dimensionless groups
-2) Edit parameters / load presets / config files
-3) Solve for steady state (Newton-Raphson)
-4) Analyze stability at a steady state
-5) Basic dynamic simulation (fixed-step RK4)
-6) Advanced dynamic simulation (multi-integrator, adaptive)
-7) Sweep feed temperature and compute steady states
-8) Steady-state sensitivity to a chosen parameter
-0) Exit
+ 1) Show current parameters and dimensionless groups
+ 2) Edit parameters / load presets / config files
+ 3) Solve for steady state (Newton-Raphson)
+ 4) Analyze stability at a steady state
+ 5) Basic dynamic simulation (fixed-step RK4)
+ 6) Advanced dynamic simulation (multi-integrator, adaptive)
+ 7) Sweep feed temperature and compute steady states
+ 8) Steady-state sensitivity to a chosen parameter
+ 9) Run internal diagnostics and self-tests
+10) Batch scenario study (library of stress tests)
+11) 2D sweep: tau vs. T_f surface
+12) Estimate parameters from synthetic data
+13) Uncertainty ensemble (Monte Carlo)
+14) Read extended modeling notes (long form)
+ 0) Exit
 =====================================================================
 ```
 

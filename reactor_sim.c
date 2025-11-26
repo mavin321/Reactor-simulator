@@ -3,6 +3,7 @@
 #include <math.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 /*
  * =====================================================================
@@ -166,6 +167,30 @@ typedef struct {
     double beta;    /* adiabatic temperature rise factor */
     double gamma;   /* dimensionless activation energy E/(R*T_f) */
 } DimensionlessInfo;
+
+/* Diagnostics and validation summary */
+typedef struct {
+    int algebra_ok;
+    int exp_ok;
+    int rhs_ok;
+    int jacobian_ok;
+    int linear_solver_ok;
+    int state_ops_ok;
+} DiagnosticsResult;
+
+/* Scenario descriptor for batch studies */
+typedef struct {
+    const char *name;              /* human readable name */
+    void (*preset_fn)(CSTRParams*);/* preset to apply before tweaks */
+    double C_A0;                   /* initial concentration */
+    double T0;                     /* initial temperature */
+    double t_final;                /* simulation horizon */
+    double dt;                     /* nominal time step */
+    double feed_shift;             /* additive tweak to T_f */
+    double coolant_shift;          /* additive tweak to T_c */
+    double noise_amp;              /* injected multiplicative noise on k0 */
+    int    use_adaptive;           /* whether to enable adaptive RK45 */
+} ScenarioDefinition;
 
 /* ---------------------------------------------------------------------
  * Utility functions
@@ -545,13 +570,6 @@ static void rk45_step(const CSTRParams *p,
                       State *err_est) /* local error estimate */
 {
     (void)t; /* t not used explicitly in autonomous system but kept for clarity */
-
-    /* Fehlberg coefficients */
-    const double a2 = 1.0/4.0;
-    const double a3 = 3.0/8.0;
-    const double a4 = 12.0/13.0;
-    const double a5 = 1.0;
-    const double a6 = 1.0/2.0;
 
     const double b21 = 1.0/4.0;
 
@@ -1292,8 +1310,612 @@ static void edit_params(CSTRParams *p) {
 }
 
 /* ---------------------------------------------------------------------
+ * Diagnostics and self-tests
+ * ------------------------------------------------------------------ */
+
+/* Small helper to write a labeled line in diagnostics CSV */
+static void diag_write(FILE *fp, const char *label, double value) {
+    if (fp) {
+        fprintf(fp, "%s,%.12g\n", label, value);
+    }
+}
+
+static DiagnosticsResult run_internal_diagnostics(const CSTRParams *p,
+                                                  const State *probe,
+                                                  const char *outfile)
+{
+    DiagnosticsResult r = {0,0,0,0,0,0};
+    FILE *fp = NULL;
+    if (outfile && strcmp(outfile, "-") != 0) {
+        fp = fopen(outfile, "w");
+        if (fp) {
+            fprintf(fp, "# diagnostic_name,value\n");
+        }
+    }
+
+    printf("\n[Internal diagnostics]\n");
+    State a = *probe;
+    State b = { probe->C_A + 1.0, probe->T + 5.0 };
+    State c = {0.0, 0.0};
+    State d = {0.0, 0.0};
+
+    /* Verify state algebra helpers */
+    state_add(&a, &b, &c);
+    state_scale(&c, 0.5, &d);
+    State e;
+    state_axpy(&a, -1.0, &b, &e);
+
+    double algebra_check = fabs(d.C_A - (a.C_A + b.C_A)/2.0) +
+                           fabs(d.T   - (a.T   + b.T)/2.0) +
+                           fabs(e.C_A - (a.C_A - b.C_A)) +
+                           fabs(e.T   - (a.T   - b.T));
+    r.state_ops_ok = (algebra_check < 1e-10);
+    printf("  State algebra check: %s (metric=%.3e)\n",
+           r.state_ops_ok ? "PASS" : "FAIL", algebra_check);
+    diag_write(fp, "state_algebra_metric", algebra_check);
+
+    /* Exercise safe_log on tricky inputs */
+    double log_neg = safe_log(-42.0);
+    double log_zero = safe_log(0.0);
+    double log_small = safe_log(1e-16);
+    r.exp_ok = isfinite(log_neg) && isfinite(log_zero) && isfinite(log_small);
+    printf("  safe_log outputs: log(-42)=%.4g, log(0)=%.4g, log(1e-16)=%.4g\n",
+           log_neg, log_zero, log_small);
+    diag_write(fp, "log_neg42", log_neg);
+    diag_write(fp, "log_zero", log_zero);
+    diag_write(fp, "log_1e-16", log_small);
+
+    /* Evaluate RHS at the probe point */
+    State rhs_probe;
+    cstr_rhs(p, probe, &rhs_probe);
+    double rhs_norm = norm2_state(&rhs_probe);
+    r.rhs_ok = isfinite(rhs_norm);
+    printf("  RHS at probe: dC_A/dt=%.6g, dT/dt=%.6g (norm=%.6g)\n",
+           rhs_probe.C_A, rhs_probe.T, rhs_norm);
+    diag_write(fp, "rhs_norm", rhs_norm);
+
+    /* Jacobian consistency: finite difference symmetry check */
+    double J[2][2];
+    numerical_jacobian(p, probe, J);
+    double skew = fabs(J[0][1] + J[1][0]);
+    r.jacobian_ok = isfinite(skew);
+    printf("  Numerical Jacobian:\n");
+    printf("    [%.6e, %.6e]\n    [%.6e, %.6e]\n",
+           J[0][0], J[0][1], J[1][0], J[1][1]);
+    printf("  Jacobian skew-symmetry metric (should be smallish): %.3e\n", skew);
+    diag_write(fp, "jacobian_skew_metric", skew);
+
+    /* Solve a miniature 2x2 system using the Jacobian and residual */
+    State F;
+    cstr_steady_residual(p, probe, &F);
+    State dx;
+    if (solve_2x2((const double (*)[2])J, &F, &dx)) {
+        r.linear_solver_ok = 1;
+        printf("  Linear solve dx = -J^-1 F => dC_A=%.6g, dT=%.6g\n",
+               dx.C_A, dx.T);
+        diag_write(fp, "linear_dx_CA", dx.C_A);
+        diag_write(fp, "linear_dx_T", dx.T);
+    } else {
+        printf("  Linear solver failed (Jacobian singular).\n");
+        diag_write(fp, "linear_solver_failed", 1.0);
+    }
+
+    /* Nonlinear algebra: one Newton iteration only */
+    State x_trial = *probe;
+    int newton_ok = newton_steady_state(p, &x_trial, 3, 1e-8, 0);
+    r.algebra_ok = newton_ok;
+    printf("  Mini-Newton attempt near probe: %s\n",
+           newton_ok ? "converged quickly" : "did not converge in 3 steps");
+    diag_write(fp, "mini_newton_converged", newton_ok ? 1.0 : 0.0);
+
+    if (fp) {
+        fclose(fp);
+        printf("  Diagnostic report written to '%s'\n", outfile);
+    }
+    return r;
+}
+
+/* ---------------------------------------------------------------------
+ * Event detection utilities
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    double T_limit;    /* temperature threshold for runaway detection */
+    double C_limit;    /* concentration threshold for depletion detection */
+    double t_trigger;  /* time at which event fired */
+    State  state_at_trigger;
+    int    triggered;
+} EventConfig;
+
+static int check_event(const State *y, const EventConfig *cfg) {
+    if (!cfg) return 0;
+    if (y->T >= cfg->T_limit) return 1;
+    if (y->C_A <= cfg->C_limit) return 1;
+    return 0;
+}
+
+static double interpolate_time_to_event(const State *y_prev, const State *y_curr,
+                                        double t_prev, double t_curr,
+                                        const EventConfig *cfg)
+{
+    double alpha = 0.5;
+    if (y_curr->T != y_prev->T && cfg->T_limit > y_prev->T && cfg->T_limit < y_curr->T) {
+        alpha = (cfg->T_limit - y_prev->T) / (y_curr->T - y_prev->T + 1e-16);
+    } else if (y_curr->C_A != y_prev->C_A && cfg->C_limit < y_prev->C_A && cfg->C_limit > y_curr->C_A) {
+        alpha = (y_prev->C_A - cfg->C_limit) / (y_prev->C_A - y_curr->C_A + 1e-16);
+    }
+    alpha = clamp(alpha, 0.0, 1.0);
+    return t_prev + alpha * (t_curr - t_prev);
+}
+
+static void simulate_with_events(const CSTRParams *p,
+                                 const State *y0,
+                                 double t_final,
+                                 double dt,
+                                 EventConfig *ev,
+                                 const char *outfile)
+{
+    FILE *fp = NULL;
+    if (outfile && strcmp(outfile, "-") != 0) {
+        fp = fopen(outfile, "w");
+        if (fp) {
+            fprintf(fp, "# time_s,C_A,T,event_flag\n");
+        }
+    }
+
+    printf("\n[Dynamic simulation with event detection]\n");
+    State y = *y0;
+    State y_next;
+    double t = 0.0;
+    int step = 0;
+    while (t < t_final && step < 100000) {
+        if (fp) {
+            fprintf(fp, "%.8f,%.12g,%.12g,%d\n", t, y.C_A, y.T, 0);
+        }
+        if (ev && check_event(&y, ev)) {
+            ev->t_trigger = t;
+            ev->state_at_trigger = y;
+            ev->triggered = 1;
+            printf("  Event triggered at t=%.6g s (C_A=%.6g, T=%.6g)\n",
+                   t, y.C_A, y.T);
+            break;
+        }
+        rk4_step(p, &y, dt, &y_next);
+        double t_next = t + dt;
+
+        if (ev && check_event(&y_next, ev)) {
+            double t_hit = interpolate_time_to_event(&y, &y_next, t, t_next, ev);
+            ev->t_trigger = t_hit;
+            ev->state_at_trigger = y_next;
+            ev->triggered = 1;
+            printf("  Event bracketed between %.6g and %.6g; interpolated hit at %.6g s\n",
+                   t, t_next, t_hit);
+            if (fp) {
+                fprintf(fp, "%.8f,%.12g,%.12g,%d\n", t_hit, y_next.C_A, y_next.T, 1);
+            }
+            break;
+        }
+
+        y = y_next;
+        t = t_next;
+        ++step;
+    }
+
+    if (fp) {
+        fclose(fp);
+        printf("  Event-aware trajectory saved to '%s'.\n", outfile);
+    }
+    if (!ev || !ev->triggered) {
+        printf("  No event detected up to t_final=%.3g s.\n", t_final);
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Batch scenario runner
+ * ------------------------------------------------------------------ */
+
+static void apply_noise_to_params(CSTRParams *p, double noise_amp) {
+    if (noise_amp <= 0.0) return;
+    double u = ((double)rand() / (double)RAND_MAX) - 0.5;
+    double factor = 1.0 + noise_amp * u;
+    p->k0 *= factor;
+}
+
+static void run_batch_scenarios(const ScenarioDefinition *list,
+                                int n,
+                                const CSTRParams *base,
+                                const char *outfile)
+{
+    FILE *fp = NULL;
+    if (outfile && strcmp(outfile, "-") != 0) {
+        fp = fopen(outfile, "w");
+        if (fp) {
+            fprintf(fp, "# scenario_name,final_t,final_C_A,final_T,event_triggered\n");
+        }
+    }
+
+    printf("\n[Batch scenario study]\n");
+    for (int i = 0; i < n; ++i) {
+        ScenarioDefinition sc = list[i];
+        CSTRParams p = *base;
+        if (sc.preset_fn) {
+            sc.preset_fn(&p);
+        }
+        p.T_f += sc.feed_shift;
+        p.T_c += sc.coolant_shift;
+        apply_noise_to_params(&p, sc.noise_amp);
+        p.adiabatic = base->adiabatic; /* keep toggles consistent */
+
+        State y0 = { sc.C_A0, sc.T0 };
+
+        EventConfig ev = {0};
+        ev.T_limit = p.T_f + 80.0;
+        ev.C_limit = 0.01 * p.C_Af;
+        ev.triggered = 0;
+
+        if (sc.use_adaptive) {
+            SimOptions opt;
+            opt.method = INTEGRATOR_RK45;
+            opt.t_final = sc.t_final;
+            opt.dt_initial = sc.dt;
+            opt.dt_min = sc.dt * 1e-4;
+            opt.dt_max = sc.dt * 50.0;
+            opt.rel_tol = 1e-5;
+            opt.abs_tol = 1e-8;
+            opt.max_steps = 200000;
+            opt.output_every = 1000;
+            opt.adaptive = 1;
+
+            /* piggyback on advanced integrator for variety */
+            simulate_dynamics_advanced(&p, &y0, &opt, "-");
+        } else {
+            simulate_with_events(&p, &y0, sc.t_final, sc.dt, &ev, "-");
+        }
+
+        if (fp) {
+            fprintf(fp, "\"%s\",%.12g,%.12g,%.12g,%d\n",
+                    sc.name, sc.t_final, ev.state_at_trigger.C_A,
+                    ev.state_at_trigger.T, ev.triggered);
+        }
+    }
+
+    if (fp) {
+        fclose(fp);
+        printf("  Batch summary saved to '%s'.\n", outfile);
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Two-parameter steady-state sweep (tau vs. T_f)
+ * ------------------------------------------------------------------ */
+
+static void sweep_tau_and_feed(CSTRParams *base_params,
+                               double tau_start, double tau_end, int tau_steps,
+                               double Tf_start, double Tf_end, int Tf_steps,
+                               const State *guess,
+                               const char *outfile)
+{
+    FILE *fp = fopen(outfile, "w");
+    if (!fp) {
+        perror("Failed to open 2D sweep output file");
+        return;
+    }
+
+    fprintf(fp, "# tau_s,Tf_K,C_A_ss,T_ss,conversion\n");
+    printf("\n[2D sweep: residence time tau vs. feed temperature T_f]\n");
+    printf("  tau: %.3g -> %.3g (%d steps)\n", tau_start, tau_end, tau_steps);
+    printf("  T_f: %.3g -> %.3g (%d steps)\n", Tf_start, Tf_end, Tf_steps);
+
+    for (int i = 0; i <= tau_steps; ++i) {
+        double alpha_tau = (double)i / (double)tau_steps;
+        double tau_val = tau_start + alpha_tau * (tau_end - tau_start);
+        for (int j = 0; j <= Tf_steps; ++j) {
+            double alpha_Tf = (double)j / (double)Tf_steps;
+            double Tf_val = Tf_start + alpha_Tf * (Tf_end - Tf_start);
+
+            CSTRParams p = *base_params;
+            p.tau = tau_val;
+            p.T_f = Tf_val;
+
+            State x = *guess;
+            int ok = newton_steady_state(&p, &x, 80, 1e-10, 0);
+            if (!ok) {
+                fprintf(fp, "%.12g,%.12g,NaN,NaN,NaN\n", tau_val, Tf_val);
+            } else {
+                double conversion = 1.0 - x.C_A / p.C_Af;
+                fprintf(fp, "%.12g,%.12g,%.12g,%.12g,%.12g\n",
+                        tau_val, Tf_val, x.C_A, x.T, conversion);
+            }
+        }
+    }
+
+    fclose(fp);
+    printf("  2D sweep surface saved to '%s'.\n", outfile);
+}
+
+/* ---------------------------------------------------------------------
+ * Synthetic parameter estimation (very lightweight)
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    double t;
+    State y;
+} Observation;
+
+static void integrate_euler(const CSTRParams *p, State *y, double dt) {
+    /* minimal wrapper to emphasize Euler path in the estimator */
+    State f;
+    cstr_rhs(p, y, &f);
+    y->C_A += dt * f.C_A;
+    y->T   += dt * f.T;
+}
+
+static int generate_synthetic_observations(const CSTRParams *p,
+                                           Observation *obs,
+                                           int max_obs,
+                                           double dt)
+{
+    if (max_obs < 4) return 0;
+    State y = { p->C_Af * 0.8, p->T_f + 5.0 };
+    double t = 0.0;
+    int k = 0;
+    for (k = 0; k < max_obs; ++k) {
+        obs[k].t = t;
+        obs[k].y = y;
+        integrate_euler(p, &y, dt);
+        t += dt;
+    }
+    return k;
+}
+
+static double simulate_for_estimation(const CSTRParams *p,
+                                      Observation *pred,
+                                      int n,
+                                      double dt)
+{
+    State y = { p->C_Af * 0.8, p->T_f + 5.0 };
+    double t = 0.0;
+    for (int i = 0; i < n; ++i) {
+        pred[i].t = t;
+        pred[i].y = y;
+        integrate_euler(p, &y, dt);
+        t += dt;
+    }
+    return t;
+}
+
+static double estimation_cost(const Observation *data,
+                              const Observation *pred,
+                              int n)
+{
+    double cost = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double dc = data[i].y.C_A - pred[i].y.C_A;
+        double dT = data[i].y.T   - pred[i].y.T;
+        /* use safe_log to keep cost well-behaved for tiny mismatches */
+        cost += 0.5 * (dc*dc + dT*dT);
+        cost += 1e-3 * fabs(safe_log(fabs(dc) + 1e-12));
+    }
+    return cost / (double)n;
+}
+
+static void fit_parameters_from_data(const CSTRParams *base) {
+    printf("\n[Lightweight parameter estimation: adjust k0 and dH]\n");
+    CSTRParams truth = *base;
+    truth.k0 = base->k0 * 1.15;
+    truth.dH = base->dH * 1.05;
+
+    Observation data[128];
+    int n_obs = generate_synthetic_observations(&truth, data, 128, base->tau / 50.0);
+    printf("  Generated %d synthetic observations using perturbed truth.\n", n_obs);
+
+    CSTRParams trial = *base;
+    Observation pred[128];
+    double dt = base->tau / 50.0;
+
+    for (int iter = 0; iter < 12; ++iter) {
+        simulate_for_estimation(&trial, pred, n_obs, dt);
+        double c0 = estimation_cost(data, pred, n_obs);
+
+        /* finite-difference gradient */
+        CSTRParams p_k0 = trial;
+        CSTRParams p_dH = trial;
+        p_k0.k0 *= 1.01;
+        p_dH.dH *= 1.01;
+        simulate_for_estimation(&p_k0, pred, n_obs, dt);
+        double c_k0 = estimation_cost(data, pred, n_obs);
+        simulate_for_estimation(&p_dH, pred, n_obs, dt);
+        double c_dH = estimation_cost(data, pred, n_obs);
+
+        double g_k0 = (c_k0 - c0) / (trial.k0 * 0.01);
+        double g_dH = (c_dH - c0) / (trial.dH * 0.01);
+
+        double step = 0.2;
+        trial.k0 -= step * g_k0 * trial.k0;
+        trial.dH -= step * g_dH * trial.dH;
+
+        printf("  Iter %2d: cost=%.6g, k0=%.6g, dH=%.6g, grad=[%.3g, %.3g]\n",
+               iter, c0, trial.k0, trial.dH, g_k0, g_dH);
+    }
+
+    printf("  Estimated parameters: k0=%.6g (truth %.6g), dH=%.6g (truth %.6g)\n",
+           trial.k0, truth.k0, trial.dH, truth.dH);
+}
+
+/* ---------------------------------------------------------------------
+ * Uncertainty ensemble (Monte Carlo style)
+ * ------------------------------------------------------------------ */
+
+typedef struct {
+    double peak_T;
+    double min_C_A;
+    double final_C_A;
+    double final_T;
+} EnsembleSummary;
+
+static void simulate_member(const CSTRParams *p,
+                            const State *y0,
+                            double t_final,
+                            EnsembleSummary *out)
+{
+    State y = *y0;
+    double t = 0.0;
+    double dt = p->tau / 80.0;
+    out->peak_T = y.T;
+    out->min_C_A = y.C_A;
+    while (t < t_final && t < p->tau * 5.0) {
+        State y_new;
+        rk2_step(p, &y, dt, &y_new);
+        y = y_new;
+        t += dt;
+        if (y.T > out->peak_T) out->peak_T = y.T;
+        if (y.C_A < out->min_C_A) out->min_C_A = y.C_A;
+    }
+    out->final_C_A = y.C_A;
+    out->final_T   = y.T;
+}
+
+static void run_uncertainty_ensemble(const CSTRParams *base,
+                                     const State *y0,
+                                     int members,
+                                     const char *outfile)
+{
+    FILE *fp = NULL;
+    if (outfile && strcmp(outfile, "-") != 0) {
+        fp = fopen(outfile, "w");
+        if (fp) {
+            fprintf(fp, "# idx,k0,E,dH,peak_T,min_C_A,final_C_A,final_T\n");
+        }
+    }
+    printf("\n[Uncertainty ensemble: %d members]\n", members);
+
+    double peak_T_max = -1e9, peak_T_min = 1e9;
+    double min_CA_max = -1e9, min_CA_min = 1e9;
+    for (int i = 0; i < members; ++i) {
+        CSTRParams p = *base;
+        double draw_k0 = 1.0 + 0.1 * (((double)rand() / RAND_MAX) - 0.5);
+        double draw_E  = 1.0 + 0.05* (((double)rand() / RAND_MAX) - 0.5);
+        double draw_dH = 1.0 + 0.07* (((double)rand() / RAND_MAX) - 0.5);
+        p.k0 *= draw_k0;
+        p.E  *= draw_E;
+        p.dH *= draw_dH;
+
+        EnsembleSummary s;
+        simulate_member(&p, y0, base->tau * 3.0, &s);
+
+        if (s.peak_T > peak_T_max) peak_T_max = s.peak_T;
+        if (s.peak_T < peak_T_min) peak_T_min = s.peak_T;
+        if (s.min_C_A > min_CA_max) min_CA_max = s.min_C_A;
+        if (s.min_C_A < min_CA_min) min_CA_min = s.min_C_A;
+
+        printf("  Member %02d: peak T=%.4g K, min C_A=%.4g mol/m^3, final=[%.4g, %.4g]\n",
+               i, s.peak_T, s.min_C_A, s.final_C_A, s.final_T);
+        if (fp) {
+            fprintf(fp, "%d,%.12g,%.12g,%.12g,%.12g,%.12g,%.12g,%.12g\n",
+                    i, p.k0, p.E, p.dH, s.peak_T, s.min_C_A, s.final_C_A, s.final_T);
+        }
+    }
+
+    printf("  Ensemble extrema: peak_T in [%.4g, %.4g], min C_A in [%.4g, %.4g]\n",
+           peak_T_min, peak_T_max, min_CA_min, min_CA_max);
+    if (fp) {
+        fclose(fp);
+        printf("  Ensemble results saved to '%s'.\n", outfile);
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Extended manual / study notes (lightweight generation)
+ * ------------------------------------------------------------------ */
+static void print_extended_manual(void) {
+    static const char *sections[] = {
+        "Modeling foundations",
+        "Numerics and stability",
+        "Operations playbook",
+        "Stress scenarios",
+        "Data and estimation",
+        NULL
+    };
+    printf("\n[Extended modeling notes]\n");
+    for (int i = 0; sections[i]; ++i) {
+        printf("  --- %s ---\n", sections[i]);
+        for (int k = 1; k <= 6; ++k) {
+            printf("    %s tip %d: see README for rationale and edge cases.\n",
+                   sections[i], k);
+        }
+    }
+    printf("  Detailed walkthroughs have been condensed; consult README.MD for full context.\n");
+}
+
+/* ---------------------------------------------------------------------
  * Menus
  * ------------------------------------------------------------------ */
+
+static int load_default_scenarios(ScenarioDefinition *out, int max_items) {
+    if (max_items < 8) return 0;
+    int k = 0;
+    out[k++] = (ScenarioDefinition){
+        "Baseline (default params)", default_params,
+        0.6, 340.0, 150.0, 1.0,
+        0.0, 0.0, 0.0, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "Adiabatic hot feed, aggressive", preset_adiabatic_hot,
+        0.8, 360.0, 120.0, 0.8,
+        10.0, -5.0, 0.2, 1
+    };
+    out[k++] = (ScenarioDefinition){
+        "Near-isothermal chill", preset_near_isothermal,
+        1.0, 330.0, 200.0, 2.0,
+        -5.0, -10.0, 0.05, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "Mild reaction stability test", preset_mild_reaction,
+        1.2, 335.0, 180.0, 1.5,
+        0.0, 0.0, 0.0, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "Strongly exothermic stress", preset_strongly_exothermic,
+        1.0, 355.0, 100.0, 0.4,
+        15.0, 0.0, 0.15, 1
+    };
+    out[k++] = (ScenarioDefinition){
+        "Coolant upset", default_params,
+        0.9, 345.0, 160.0, 1.0,
+        0.0, 25.0, 0.0, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "Feed temperature ramp", default_params,
+        0.7, 340.0, 200.0, 1.5,
+        20.0, 0.0, 0.1, 1
+    };
+    out[k++] = (ScenarioDefinition){
+        "Low residence time", default_params,
+        0.5, 330.0, 80.0, 0.25,
+        -15.0, -5.0, 0.0, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "High residence time", default_params,
+        0.9, 338.0, 400.0, 4.0,
+        0.0, 0.0, 0.05, 0
+    };
+    out[k++] = (ScenarioDefinition){
+        "Aggressive coolant removal", preset_near_isothermal,
+        1.1, 350.0, 120.0, 0.75,
+        5.0, -30.0, 0.12, 1
+    };
+    out[k++] = (ScenarioDefinition){
+        "Noisy kinetics stress test", default_params,
+        0.95, 345.0, 220.0, 2.2,
+        0.0, 0.0, 0.3, 1
+    };
+    out[k++] = (ScenarioDefinition){
+        "Very cold start", default_params,
+        0.6, 310.0, 300.0, 3.0,
+        -25.0, -20.0, 0.0, 0
+    };
+    return k;
+}
 
 static void print_main_menu(void) {
     printf("\n================== ADVANCED CSTR REACTOR SIMULATOR ==================\n");
@@ -1305,6 +1927,12 @@ static void print_main_menu(void) {
     printf(" 6) Advanced dynamic simulation (multi-integrator, adaptive)\n");
     printf(" 7) Sweep feed temperature and compute steady states\n");
     printf(" 8) Steady-state sensitivity to a chosen parameter\n");
+    printf(" 9) Run internal diagnostics and self-tests\n");
+    printf("10) Batch scenario study (library of stress tests)\n");
+    printf("11) 2D sweep: tau vs. T_f surface\n");
+    printf("12) Estimate parameters from synthetic data\n");
+    printf("13) Uncertainty ensemble (Monte Carlo)\n");
+    printf("14) Read extended modeling notes (long form)\n");
     printf(" 0) Exit\n");
     printf("=====================================================================\n");
     printf("Enter choice: ");
@@ -1344,6 +1972,7 @@ static void print_param_sensitivity_menu(void) {
 int main(void) {
     CSTRParams params;
     default_params(&params);
+    srand((unsigned)time(NULL));
 
     int running = 1;
     while (running) {
@@ -1538,6 +2167,71 @@ int main(void) {
                 continue;
             }
             steady_state_sensitivity(&params, param_id, rel_delta, &x);
+        }
+        else if (choice == 9) {
+            /* Diagnostics */
+            State probe;
+            probe.C_A = params.C_Af * 0.5;
+            probe.T   = params.T_f + 10.0;
+            char fname[256];
+            printf("Enter diagnostics CSV filename (or '-' for none): ");
+            if (scanf("%255s", fname) != 1) { strcpy(fname, "-"); }
+            run_internal_diagnostics(&params, &probe, fname);
+        }
+        else if (choice == 10) {
+            /* Batch scenarios */
+            ScenarioDefinition sc[16];
+            int n = load_default_scenarios(sc, 16);
+            char fname[256];
+            printf("Enter batch summary filename (or '-' to skip file): ");
+            if (scanf("%255s", fname) != 1) { strcpy(fname, "-"); }
+            run_batch_scenarios(sc, n, &params, fname);
+        }
+        else if (choice == 11) {
+            /* 2D sweep */
+            double tau_start, tau_end, Tf_start, Tf_end;
+            int tau_steps, Tf_steps;
+            State guess;
+            char fname[256];
+            printf("Enter tau start, tau end, number of steps (e.g., 20 200 30): ");
+            if (scanf("%lf %lf %d", &tau_start, &tau_end, &tau_steps) != 3) {
+                fprintf(stderr, "Bad tau sweep input.\n"); continue;
+            }
+            printf("Enter T_f start, T_f end, number of steps (e.g., 300 400 30): ");
+            if (scanf("%lf %lf %d", &Tf_start, &Tf_end, &Tf_steps) != 3) {
+                fprintf(stderr, "Bad T_f sweep input.\n"); continue;
+            }
+            printf("Enter steady-state guess C_A and T: ");
+            if (scanf("%lf %lf", &guess.C_A, &guess.T) != 2) {
+                fprintf(stderr, "Bad guess input.\n"); continue;
+            }
+            printf("Enter output CSV filename: ");
+            if (scanf("%255s", fname) != 1) { fprintf(stderr, "Bad filename.\n"); continue; }
+            sweep_tau_and_feed(&params, tau_start, tau_end, tau_steps,
+                               Tf_start, Tf_end, Tf_steps, &guess, fname);
+        }
+        else if (choice == 12) {
+            /* Parameter estimation */
+            fit_parameters_from_data(&params);
+        }
+        else if (choice == 13) {
+            /* Uncertainty ensemble */
+            State y0;
+            int members;
+            char fname[256];
+            printf("Enter initial C_A (mol/m^3): ");
+            if (scanf("%lf", &y0.C_A) != 1) { fprintf(stderr, "Bad input.\n"); continue; }
+            printf("Enter initial T (K): ");
+            if (scanf("%lf", &y0.T) != 1) { fprintf(stderr, "Bad input.\n"); continue; }
+            printf("Enter number of ensemble members (e.g., 20): ");
+            if (scanf("%d", &members) != 1 || members <= 0) { fprintf(stderr, "Bad member count.\n"); continue; }
+            printf("Enter ensemble CSV filename (or '-' to skip file): ");
+            if (scanf("%255s", fname) != 1) { strcpy(fname, "-"); }
+            run_uncertainty_ensemble(&params, &y0, members, fname);
+        }
+        else if (choice == 14) {
+            /* Extended manual */
+            print_extended_manual();
         }
         else {
             printf("Unknown choice.\n");
